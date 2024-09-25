@@ -10,22 +10,22 @@ import (
 )
 
 var (
-	clients      = make(map[net.Conn]string) // Track clients with a unique identifier
-	clientsMutex sync.Mutex                  // Mutex to protect concurrent access to clients map
+	clients      = make(map[net.Conn]string)    // Track clients with their remote address
+	clientsMutex sync.Mutex                     // Protect concurrent access to clients map
+	pendingReqs  = make(map[string]net.Conn)    // Track pending conversation requests
 )
 
 func main() {
-	// Listen on TCP port 8080
 	ln, err := net.Listen("tcp", ":8080")
 	if err != nil {
-		fmt.Println("Error starting server:", err)
+		fmt.Printf("Error starting server: %v\n", err)
 		os.Exit(1)
 	}
 	defer ln.Close()
 
 	fmt.Println("Server is running on port 8080...")
 
-	// Handle incoming client connections
+	// Goroutine to accept new client connections
 	go func() {
 		for {
 			conn, err := ln.Accept()
@@ -34,10 +34,7 @@ func main() {
 				continue
 			}
 
-			// Assign a name/ID to the client (e.g., use the remote address)
 			clientID := conn.RemoteAddr().String()
-
-			// Add client to the list of connected clients
 			clientsMutex.Lock()
 			clients[conn] = clientID
 			clientsMutex.Unlock()
@@ -45,17 +42,20 @@ func main() {
 			fmt.Printf("Client %s connected\n", clientID)
 			printConnectedClients()
 
-			// Start a goroutine to handle communication with the client
+			// Notify all clients about the new connection
+			broadcastClientList()
+
+			// Handle each client connection in a new goroutine
 			go handleConnection(conn)
 		}
 	}()
 
-	// Server input: to allow the server to send messages to clients
+	// Allow server to send messages or target specific clients
 	scanner := bufio.NewScanner(os.Stdin)
 	for {
 		fmt.Println("Send a broadcast message or target a client (clientID):")
 		scanner.Scan()
-		input := strings.TrimSpace(scanner.Text()) // Trim spaces
+		input := strings.TrimSpace(scanner.Text())
 
 		if input == "broadcast" {
 			fmt.Println("Enter broadcast message:")
@@ -67,7 +67,7 @@ func main() {
 			clientsMutex.Lock()
 			var targetConn net.Conn
 			for conn, id := range clients {
-				if id == input {
+				if strings.HasPrefix(id, input) { // Allow partial match (IP only)
 					targetConn = conn
 					break
 				}
@@ -75,7 +75,7 @@ func main() {
 			clientsMutex.Unlock()
 
 			if targetConn != nil {
-				fmt.Println("Enter message for", input, ":")
+				fmt.Printf("Enter message for %s: ", input)
 				scanner.Scan()
 				message := scanner.Text() + "\n"
 				sendMessageToClient(targetConn, message)
@@ -86,10 +86,9 @@ func main() {
 	}
 }
 
-// Function to handle individual client connections
+// Function to handle communication with individual clients
 func handleConnection(conn net.Conn) {
 	defer func() {
-		// Remove client from the list of connected clients upon disconnection
 		clientsMutex.Lock()
 		clientID := clients[conn]
 		delete(clients, conn)
@@ -98,30 +97,62 @@ func handleConnection(conn net.Conn) {
 		fmt.Printf("Client %s disconnected\n", clientID)
 		printConnectedClients()
 
+		// Notify all clients about the disconnection
+		broadcastClientList()
+
 		conn.Close()
 	}()
 
 	reader := bufio.NewReader(conn)
-
 	for {
 		message, err := reader.ReadString('\n')
 		if err != nil {
-			fmt.Println("Error reading from client or client disconnected:", err)
+			fmt.Printf("Error reading from client: %v\n", err)
 			return
 		}
 
-		// Lock mutex to safely retrieve the client's ID
 		clientsMutex.Lock()
 		clientID := clients[conn]
 		clientsMutex.Unlock()
 
-		// Print the client's message along with their ID
-		fmt.Printf("Message from client %s: %s", clientID, message)
+		if strings.HasPrefix(message, "start:") {
+			targetID := strings.TrimSpace(strings.Split(message, ":")[1])
 
-		// If the client sends "end", close the connection for this client
-		if strings.TrimSpace(message) == "end" {
-			fmt.Printf("Client %s has requested to disconnect.\n", clientID)
-			return
+			// Find target client
+			clientsMutex.Lock()
+			var targetConn net.Conn
+			for conn, id := range clients {
+				if strings.HasPrefix(id, targetID) { // Allow partial match (IP only)
+					targetConn = conn
+					break
+				}
+			}
+			clientsMutex.Unlock()
+
+			if targetConn != nil {
+				sendMessageToClient(targetConn, "Conversation request from "+clientID+"\n")
+				pendingReqs[clientID] = targetConn
+			} else {
+				sendMessageToClient(conn, "Client "+targetID+" not found\n")
+			}
+
+		} else if strings.TrimSpace(message) == "ok" && pendingReqs[clientID] != nil {
+			targetConn := pendingReqs[clientID]
+			sendMessageToClient(targetConn, "Client "+clientID+" accepted the conversation\n")
+			delete(pendingReqs, clientID)
+
+		} else if strings.TrimSpace(message) == "no" && pendingReqs[clientID] != nil {
+			targetConn := pendingReqs[clientID]
+			sendMessageToClient(targetConn, "Client "+clientID+" rejected the conversation\n")
+			delete(pendingReqs, clientID)
+
+		} else {
+			fmt.Printf("Message from client %s: %s", clientID, message)
+
+			if strings.TrimSpace(message) == "end" {
+				fmt.Printf("Client %s requested to disconnect.\n", clientID)
+				return
+			}
 		}
 	}
 }
@@ -141,13 +172,13 @@ func sendMessageToClient(conn net.Conn, message string) {
 	writer := bufio.NewWriter(conn)
 	_, err := writer.WriteString(message)
 	if err != nil {
-		fmt.Println("Error sending message to client:", err)
+		fmt.Printf("Error sending message to client: %v\n", err)
 		return
 	}
-	writer.Flush() // Ensure the message is sent immediately
+	writer.Flush()
 }
 
-// Function to print the list of connected clients
+// Function to print all connected clients
 func printConnectedClients() {
 	clientsMutex.Lock()
 	defer clientsMutex.Unlock()
@@ -155,5 +186,20 @@ func printConnectedClients() {
 	fmt.Println("Connected clients:")
 	for _, clientID := range clients {
 		fmt.Println(" -", clientID)
+	}
+}
+
+// Function to broadcast the list of connected clients to all clients
+func broadcastClientList() {
+	clientsMutex.Lock()
+	defer clientsMutex.Unlock()
+
+	clientList := "Connected clients:\n"
+	for _, clientID := range clients {
+		clientList += " - " + clientID + "\n"
+	}
+
+	for conn := range clients {
+		sendMessageToClient(conn, clientList)
 	}
 }

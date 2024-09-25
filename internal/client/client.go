@@ -11,34 +11,46 @@ import (
 )
 
 func main() {
-	// Connect to the server
-	conn, err := net.Dial("tcp", "localhost:8080")
+	conn, err := net.Dial("tcp", ":8080")
 	if err != nil {
-		fmt.Println("Error connecting to server:", err)
+		fmt.Printf("Error connecting to server: %v\n", err)
 		return
 	}
 	defer conn.Close()
 
-	// Channel to handle termination signals
+	// Handle termination signals
 	signalChan := make(chan os.Signal, 1)
 	signal.Notify(signalChan, syscall.SIGINT, syscall.SIGTERM)
 
-	// Channel to communicate between goroutines
+	// Communicate between goroutines
 	doneChan := make(chan struct{})
 
-	// Goroutine to handle server responses
+	// Goroutine to listen for messages from the server
 	go func() {
+		reader := bufio.NewReader(conn)
 		for {
 			select {
 			case <-doneChan:
-				return // Exit the loop when doneChan is closed
+				return // Exit when doneChan is closed
 			default:
-				message, err := bufio.NewReader(conn).ReadString('\n')
+				message, err := reader.ReadString('\n')
 				if err != nil {
-					fmt.Println("Error reading from server or server disconnected:", err)
+					fmt.Printf("Error reading from server: %v\n", err)
 					return
 				}
-				fmt.Print("Server response: ", message)
+				fmt.Print("Server: ", message)
+
+				// If it's a conversation request, handle it
+				if strings.HasPrefix(message, "Conversation request from") {
+					fmt.Print("Accept conversation (yes/no)? ")
+					var response string
+					fmt.Scanln(&response)
+					if strings.ToLower(response) == "yes" {
+						conn.Write([]byte("ok\n"))
+					} else {
+						conn.Write([]byte("no\n"))
+					}
+				}
 			}
 		}
 	}()
@@ -46,27 +58,29 @@ func main() {
 	// Goroutine to send client input to server
 	go func() {
 		scanner := bufio.NewScanner(os.Stdin)
-		for scanner.Scan() {
+		for {
+			fmt.Print("Enter message or 'start:clientID' to initiate conversation: ")
+			scanner.Scan()
 			text := scanner.Text() + "\n"
 			conn.Write([]byte(text))
 
-			// If client types "end", break the loop to close the connection
-			if strings.TrimSpace(scanner.Text()) == "end" {
+			// If the client types "end", break the loop and end connection
+			if strings.TrimSpace(text) == "end" {
 				break
 			}
 		}
-		close(doneChan) // Signal the reading loop to stop
+		close(doneChan) // Signal the reading goroutine to stop
 	}()
 
-	// Goroutine to handle termination signal
+	// Goroutine to handle termination signals
 	go func() {
 		<-signalChan
-		fmt.Println("\nClient terminating, sending disconnect signal to server.")
+		fmt.Println("\nClient terminating, notifying server...")
 		conn.Write([]byte("Client disconnected\n"))
-		close(doneChan) // Signal the reading loop to stop
+		close(doneChan)
 	}()
 
 	// Block until doneChan is closed
 	<-doneChan
-	fmt.Println("Client has exited.")
+	fmt.Println("Client has exited")
 }
